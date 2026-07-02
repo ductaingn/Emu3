@@ -66,3 +66,71 @@ class Emu3PrefixConstrainedLogitsHelper:
             return (self.pad_token, )
         else:
             return self.visual_tokens
+
+class Emu3PrefixConstrainedVideoLogitsHelper:
+
+    def __init__(
+        self,
+        height,
+        width,
+        frames,
+        img_token,
+        eoi_token,
+        eos_token,
+        eol_token,
+        eof_token,
+        pad_token,
+        visual_tokens,
+    ):
+        self.height = height
+        self.width = width
+        self.frames = frames
+        self.img_token = img_token
+        self.eoi_token = eoi_token
+        self.eos_token = eos_token
+        self.eol_token = eol_token
+        self.eof_token = eof_token
+        self.pad_token = pad_token
+        self.visual_tokens = visual_tokens
+
+        self.offset_cache = {}
+
+    def __call__(self, batch_id, input_ids):
+        if batch_id not in self.offset_cache:
+            position = torch.nonzero(input_ids == self.img_token, as_tuple=True)[0][0]
+            self.offset_cache[batch_id] = position
+
+        height = self.height[batch_id] if self.height.shape[0] > 1 else self.height[0]
+        width = self.width[batch_id] if self.width.shape[0] > 1 else self.width[0]
+        frames = self.frames[batch_id] if self.frames.shape[0] > 1 else self.frames[0]
+
+        offset = input_ids.shape[0] - self.offset_cache[batch_id]
+        height = height.to(offset.device)
+        width = width.to(offset.device)
+
+        if offset == (width * height + 1) * frames + 1:
+            return (self.eoi_token, )
+        elif offset % (width * height + 1) == 0:
+            return (self.eof_token, )
+        elif offset == (width * height + 1) * frames + 2:
+            return (self.eos_token, )
+        elif offset > (width * height + 1) * frames + 2:
+            return (self.pad_token, )
+            # return (self.eos_token, )
+        else:
+            return self.visual_tokens
+
+        # 计算帧和帧内偏移
+        # frame_offset = offset // (width * height+1)
+        # in_frame_offset = offset % (width * height+1)
+
+        # if frame_offset == frames:  # 全部帧处理完成，返回 EOI
+        #     return (self.eoi_token,)
+        # elif in_frame_offset == 0:  # 当前帧结束，返回 EOF
+        #     return (self.eof_token,)
+        # elif offset == (width * height + 1) * frames + 1:  # 序列结束，返回 EOS
+        #     return (self.eos_token,)
+        # elif offset > (width * height + 1) * frames + 1:  # 超出范围，返回 PAD
+        #     return (self.pad_token,)
+        # else:  # 返回视觉 token
+        #     return self.visual_tokens

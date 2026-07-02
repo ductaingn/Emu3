@@ -70,6 +70,10 @@ class Emu3Tokenizer(PreTrainedTokenizer):
         eoi_token = "<|image end|>",
         eol_token = "<|extra_200|>",
         eof_token = "<|extra_201|>",
+        boa_token = "<|extra_198|>",
+        eoa_token = "<|extra_199|>",
+        bot_token = "<|extra_196|>",
+        eot_token = "<|extra_197|>",
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -125,6 +129,10 @@ class Emu3Tokenizer(PreTrainedTokenizer):
         self.eoi_token = eoi_token
         self.eol_token = eol_token
         self.eof_token = eof_token
+        self.boa_token = boa_token
+        self.eoa_token = eoa_token
+        self.bot_token = bot_token
+        self.eot_token = eot_token
 
     def __getstate__(self):
         # for pickle lovers

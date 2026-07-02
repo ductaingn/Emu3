@@ -58,6 +58,9 @@ if is_flash_attn_2_available():
     from flash_attn import flash_attn_func, flash_attn_varlen_func
     from flash_attn.bert_padding import index_first_axis, pad_input, unpad_input  # noqa
 
+import sys
+sys.path.append("/home/linh/ductai_nguyen_ws/UniVLA")
+from models.policy_head.noise_schedulers import FlowMatchingScheduler
 
 # This makes `_prepare_4d_causal_attention_mask` a leaf function in the FX graph.
 # It means that the function will not be traced through and simply appear as a node in the graph.
@@ -137,16 +140,28 @@ class Emu3RotaryEmbedding(nn.Module):
         self._set_cos_sin_cache(
             seq_len=max_position_embeddings, device=self.inv_freq.device, dtype=torch.get_default_dtype()
         )
-
+    
     def _set_cos_sin_cache(self, seq_len, device, dtype):
         self.max_seq_len_cached = seq_len
-        t = torch.arange(self.max_seq_len_cached, device=device, dtype=self.inv_freq.dtype)
-
-        freqs = torch.outer(t, self.inv_freq)
-        # Different from paper, but it uses a different permutation in order to obtain the same calculation
+        # 强制 float32，不依赖 arange(dtype=...)，规避环境污染
+        t = torch.arange(self.max_seq_len_cached, device="cpu").float().to(device=device, dtype=torch.float32)
+        # inv_freq = self.inv_freq.to(torch.float32).to(device=device)
+        inv_freq = 1.0 / (self.base ** (torch.arange(0, self.dim, 2).float().to(device) / self.dim)).to(torch.float32).to(device=device)
+        freqs = torch.outer(t, inv_freq)
         emb = torch.cat((freqs, freqs), dim=-1)
+
         self.register_buffer("cos_cached", emb.cos().to(dtype), persistent=False)
         self.register_buffer("sin_cached", emb.sin().to(dtype), persistent=False)
+
+    # def _set_cos_sin_cache(self, seq_len, device, dtype):
+    #     self.max_seq_len_cached = seq_len
+    #     t = torch.arange(self.max_seq_len_cached, device=device, dtype=self.inv_freq.dtype)
+
+    #     freqs = torch.outer(t, self.inv_freq)
+    #     # Different from paper, but it uses a different permutation in order to obtain the same calculation
+    #     emb = torch.cat((freqs, freqs), dim=-1)
+    #     self.register_buffer("cos_cached", emb.cos().to(dtype), persistent=False)
+    #     self.register_buffer("sin_cached", emb.sin().to(dtype), persistent=False)
 
     def forward(self, x, seq_len=None):
         # x: [bs, num_attention_heads, seq_len, head_size]
@@ -315,9 +330,13 @@ class Emu3Attention(nn.Module):
                 f" and `num_heads`: {self.num_heads})."
             )
 
-        self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=False)
-        self.k_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
-        self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
+        # modify here
+        # self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=False)
+        # self.k_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
+        # self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
+        self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=config.qkv_bias)
+        self.k_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.qkv_bias)
+        self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.qkv_bias)
         self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
         self._init_rope()
 
@@ -1229,7 +1248,6 @@ class Emu3ForCausalLM(Emu3PreTrainedModel):
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-
         # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
         outputs = self.model(
             input_ids=input_ids,
@@ -1341,3 +1359,377 @@ class Emu3ForCausalLM(Emu3PreTrainedModel):
                 tuple(past_state.index_select(0, beam_idx.to(past_state.device)) for past_state in layer_past),
             )
         return reordered_past
+
+
+class ActionProjector(nn.Module):
+    def __init__(self, in_channels, dim):
+        super(ActionProjector, self).__init__()
+        # Initialize the linear layers W1, W2, W3
+        self.W1 = nn.Linear(in_channels, dim)
+        self.W2 = nn.Linear(dim + dim, dim)  # Concatenating 2 encodings (dim + dim)
+        self.W3 = nn.Linear(dim, dim)
+        self.nonlinearity = nn.SiLU()  # swish
+        
+        # Initialize the weights
+        self._initialize_weights()
+
+    def _initialize_weights(self):
+        # Use Xavier initialization for the linear layer weights
+        nn.init.xavier_uniform_(self.W1.weight)
+        nn.init.xavier_uniform_(self.W2.weight)
+        nn.init.xavier_uniform_(self.W3.weight)
+        
+        # Initialize the biases to zeros
+        if self.W1.bias is not None:
+            nn.init.zeros_(self.W1.bias)
+        if self.W2.bias is not None:
+            nn.init.zeros_(self.W2.bias)
+        if self.W3.bias is not None:
+            nn.init.zeros_(self.W3.bias)
+
+    def forward(self, x, tau):
+        """
+        Forward pass through the ActionProjector.
+
+        Args:
+            x (torch.Tensor): Input tensor, shape (batch_size, seq_len, dim)
+            tau (torch.Tensor): Timestep tensor, shape (batch_size, seq_len, dim)
+
+        Returns:
+            torch.Tensor: Output tensor, shape (batch_size, seq_len, dim)
+        """
+        # Apply linear transformation W1 to each element in the sequence (along dim=2)
+        out1 = self.W1(x)  # Shape: (batch_size, seq_len, dim)
+
+        # Concatenate out1 and tau along the last dimension
+        out2 = self.W2(torch.cat([out1, tau], dim=-1))  # Shape: (batch_size, seq_len, dim)
+
+        # Apply linear transformation W3
+        out3 = self.W3(self.nonlinearity(out2))  # Shape: (batch_size, seq_len, dim)
+
+        return out3
+
+class FinalLayer(nn.Module):
+    def __init__(self, hidden_size, out_channels):
+        super().__init__()
+        self.norm_final = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.linear = nn.Linear(
+            hidden_size, out_channels, bias=True
+        )
+        self.adaLN_modulation = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(hidden_size, 2 * hidden_size, bias=True),
+        )
+        # # init zero
+        nn.init.constant_(self.linear.weight, 0)
+        nn.init.constant_(self.linear.bias, 0)
+
+    def modulate(self, x, shift, scale):
+        return x * (1 + scale) + shift
+
+    def forward(self, x, c):
+        shift, scale = self.adaLN_modulation(c).chunk(2, dim=2)
+        x = self.modulate(self.norm_final(x), shift, scale)
+        x = self.linear(x)
+        return x
+
+class SinusoidalPosEmb(nn.Module):
+    def __init__(self, dim, theta=10000):
+        super().__init__()
+        self.dim = dim
+        self.theta = theta
+
+    def forward(self, x):
+        device = x.device
+        half_dim = self.dim // 2
+        emb = math.log(self.theta) / (half_dim - 1)
+        emb = torch.exp(torch.arange(half_dim, device=device) * -emb)
+        emb = x[:, None] * emb[None, :]
+        emb = torch.cat((emb.sin(), emb.cos()), dim=-1)
+        return emb
+
+class Emu3MoE(Emu3PreTrainedModel):
+    _tied_weights_keys = ["lm_head.weight"]
+
+    def __init__(self, config):
+        super().__init__(config)
+        
+        # Base model (the same as in Emu3ForCausalLM)
+        self.model = Emu3Model(config)
+        self.vocab_size = config.vocab_size
+
+        if hasattr(config, "vision_loss_weight"):
+            self.use_weight = True
+            self.vision_loss_weight = config.vision_loss_weight
+            self.eov_token_id = config.eov_token_id
+            self.bov_token_id = config.bov_token_id
+        else:
+            self.use_weight = False
+
+        print(f"config type: {type(config)}")
+        print("config:", config)
+        if config.action_experts:
+            self.action_experts = config.action_experts
+            action_config = Emu3Config.from_dict(config.action_config)
+            self.vision_loss_weight = action_config.vision_loss_weight
+            self.action_projector = ActionProjector(config.action_dim, action_config.hidden_size)
+            self.action_layers = nn.ModuleList(
+                [Emu3DecoderLayer(action_config, layer_idx) for layer_idx in range(action_config.num_hidden_layers)]
+            )
+            self.action_decoder = FinalLayer(action_config.hidden_size, config.action_dim)
+            # self.rf = FlowMatchingScheduler(sample_method="uniform", s = 1.0)
+            self.rf = FlowMatchingScheduler(sample_method="beta", s = 1.0)
+            self.tau_emb = SinusoidalPosEmb(action_config.hidden_size)
+        
+        # Output head (same as Emu3ForCausalLM)
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        
+        # Initialize weights and apply final processing
+        self.post_init()
+
+    def get_input_embeddings(self):
+        return self.model.embed_tokens
+
+    def set_input_embeddings(self, value):
+        self.model.embed_tokens = value
+
+    def get_output_embeddings(self):
+        return self.lm_head
+
+    def set_output_embeddings(self, new_embeddings):
+        self.lm_head = new_embeddings
+
+    def set_decoder(self, decoder):
+        self.model = decoder
+
+    def get_decoder(self):
+        return self.model
+
+    @add_start_docstrings_to_model_forward(EMU3_INPUTS_DOCSTRING)
+    @replace_return_docstrings(output_type=CausalLMOutputWithPast, config_class=_CONFIG_FOR_DOC)
+    def forward(
+        self,
+        input_ids: torch.LongTensor = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[List[torch.FloatTensor]] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        labels: Optional[torch.LongTensor] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        action: Optional[torch.Tensor] = None,
+    ) -> Union[Tuple, CausalLMOutputWithPast]:
+        r"""
+        Args:
+            labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
+                Labels for computing the masked language modeling loss. Indices should either be in `[0, ...,
+                config.vocab_size]` or -100 (see `input_ids` docstring). Tokens with indices set to `-100` are ignored
+                (masked), the loss is only computed for the tokens with labels in `[0, ..., config.vocab_size]`.
+
+        Returns:
+            Example output will be the same as in Emu3ForCausalLM, with the inclusion of MoE-based processing.
+        """
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        )
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        
+        # Decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
+        outputs = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+        )
+
+        hidden_states = outputs[0]
+
+        seq_len = hidden_states.shape[1]
+
+        # processing action
+        if action is not None and self.action_experts and self.training:
+            # Generate noise with the same shape and data type as the action tensor
+            noise = torch.randn_like(action, dtype=action.dtype)
+
+            # Sample tau values and ensure the data type matches the noise tensor
+            tau = self.rf.sample_t(noise.shape[0]).to(noise.dtype)
+
+            noise_action = self.rf.add_noise(action, noise, tau)
+
+            # Use forward_action to compute predictions and updated hidden states
+            velo_pred, hidden_states_refine = self.forward_action(noise_action, tau, hidden_states)
+
+            # flow matching loss
+            loss_action = F.mse_loss(noise - action, velo_pred)
+
+        if self.config.pretraining_tp > 1:
+            lm_head_slices = self.lm_head.weight.split(self.vocab_size // self.config.pretraining_tp, dim=0)
+            logits = [F.linear(hidden_states, lm_head_slices[i]) for i in range(self.config.pretraining_tp)]
+            logits = torch.cat(logits, dim=-1)
+        else:
+            logits = self.lm_head(hidden_states)
+        logits = logits.float()
+
+        loss = None
+        if labels is not None:
+            # Shift so that tokens < n predict n
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+            # Flatten the tokens
+            if self.use_weight:
+                weights = torch.ones(self.config.vocab_size)
+                vision_token_range = range(self.bov_token_id,self.eov_token_id+1)
+                weights[vision_token_range] = self.vision_loss_weight
+                loss_fct = CrossEntropyLoss(weight=weights.to(logits.device))
+
+            else:
+                loss_fct = CrossEntropyLoss()
+            shift_logits = shift_logits.view(-1, self.config.vocab_size)
+            shift_labels = shift_labels.view(-1)
+            # Enable model parallelism
+            shift_labels = shift_labels.to(shift_logits.device)
+            
+            loss = loss_fct(shift_logits, shift_labels)
+            if action is not None and self.action_experts:
+                loss += loss_action * self.vision_loss_weight
+            # loss = loss_action
+        if not return_dict:
+            output = (logits,) + outputs[1:]
+            return (loss,) + output if loss is not None else output
+
+        return CausalLMOutputWithPast(
+            loss=loss,
+            logits=logits,
+            past_key_values=outputs.past_key_values,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+        )
+
+    def prepare_inputs_for_generation(
+        self, input_ids, past_key_values=None, attention_mask=None, inputs_embeds=None, **kwargs
+    ):
+        if past_key_values is not None:
+            if isinstance(past_key_values, Cache):
+                cache_length = past_key_values.get_seq_length()
+                past_length = past_key_values.seen_tokens
+                max_cache_length = past_key_values.get_max_length()
+            else:
+                cache_length = past_length = past_key_values[0][0].shape[2]
+                max_cache_length = None
+
+            # Keep only the unprocessed tokens:
+            # 1 - If the length of the attention_mask exceeds the length of input_ids, then we are in a setting where
+            # some of the inputs are exclusivelly passed as part of the cache (e.g. when passing input_embeds as
+            # input)
+            if attention_mask is not None and attention_mask.shape[1] > input_ids.shape[1]:
+                input_ids = input_ids[:, -(attention_mask.shape[1] - past_length) :]
+            # 2 - If the past_length is smaller than input_ids', then input_ids holds all input tokens. We can discard
+            # input_ids based on the past_length.
+            elif past_length < input_ids.shape[1]:
+                input_ids = input_ids[:, past_length:]
+            # 3 - Otherwise (past_length >= input_ids.shape[1]), let's assume input_ids only has unprocessed tokens.
+
+            # If we are about to go beyond the maximum cache length, we need to crop the input attention mask.
+            if (
+                max_cache_length is not None
+                and attention_mask is not None
+                and cache_length + input_ids.shape[1] > max_cache_length
+            ):
+                attention_mask = attention_mask[:, -max_cache_length:]
+
+        position_ids = kwargs.get("position_ids", None)
+        if attention_mask is not None and position_ids is None:
+            # create position_ids on the fly for batch generation
+            position_ids = attention_mask.long().cumsum(-1) - 1
+            position_ids.masked_fill_(attention_mask == 0, 1)
+            if past_key_values:
+                position_ids = position_ids[:, -input_ids.shape[1] :]
+
+        # if `inputs_embeds` are passed, we only want to use them in the 1st generation step
+        if inputs_embeds is not None and past_key_values is None:
+            model_inputs = {"inputs_embeds": inputs_embeds}
+        else:
+            model_inputs = {"input_ids": input_ids}
+
+        model_inputs.update(
+            {
+                "position_ids": position_ids,
+                "past_key_values": past_key_values,
+                "use_cache": kwargs.get("use_cache"),
+                "attention_mask": attention_mask,
+            }
+        )
+        return model_inputs
+
+    @staticmethod
+    def _reorder_cache(past_key_values, beam_idx):
+        reordered_past = ()
+        for layer_past in past_key_values:
+            reordered_past += (
+                tuple(past_state.index_select(0, beam_idx.to(past_state.device)) for past_state in layer_past),
+            )
+        return reordered_past
+
+    def forward_action(self, z, t, cond):
+
+        # Embed the sampled tau values and adjust the data type to match the noise tensor
+        tau_emb = self.tau_emb(t).to(z.dtype)
+
+        # Repeat tau embeddings along the action dimension to match the input shape
+        tau_emb = tau_emb.repeat(1, z.shape[1], 1)
+
+        seq_len = cond.shape[1]
+
+        # Compute action embeddings using the action projector and the tau embeddings
+        action_hidden_states = self.action_projector(z, tau_emb)
+
+        # Concat in sequence dimension
+        action_hidden_states = torch.cat([cond, action_hidden_states], dim=1)
+        # transformer layers
+        for action_layer in self.action_layers:
+            action_hidden_states = action_layer(
+                action_hidden_states
+            )[0]
+        hidden_states, action_hidden_states = action_hidden_states[:, :seq_len, :], action_hidden_states[:, seq_len:, :]
+        velo_pred = self.action_decoder(action_hidden_states, tau_emb)
+
+        return velo_pred, hidden_states
+
+    def generate_action(self, outputs, sample_steps = 20, frames = 8, action_dim = 7):
+
+        input_ids = outputs
+        batch_size, seq_len = input_ids.shape
+        attention_mask = torch.ones_like(input_ids)
+        position_ids = torch.arange(input_ids.shape[1], device=input_ids.device).unsqueeze(0)
+
+        outputs = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            output_hidden_states=True,
+        )
+
+        hidden_states = outputs[0]
+
+        # action generation 
+        z = torch.randn((batch_size, frames, action_dim), dtype=hidden_states.dtype).to(hidden_states.device)
+        dt = 1.0 / sample_steps
+
+        for i in range(sample_steps, 0, -1):
+            t = i / sample_steps
+            t = torch.tensor([t] * batch_size).to(hidden_states.device)
+
+            velo_pred, hidden_states_i = self.forward_action(z, t, cond = hidden_states)
+
+            z = z - dt * velo_pred
+        
+        return z
+

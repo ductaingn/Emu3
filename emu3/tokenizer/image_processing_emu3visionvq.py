@@ -356,7 +356,7 @@ class Emu3VisionVQImageProcessor(BaseImageProcessor):
         do_normalize: Optional[bool] = None,
         image_mean: Optional[Union[float, List[float]]] = None,
         image_std: Optional[Union[float, List[float]]] = None,
-        return_tensors: str | TensorType = "PIL.Image.Image",
+        return_tensors: str or TensorType = "PIL.Image.Image",
         input_data_format: Optional[Union[str, ChannelDimension]] = None,
     ):
         """
